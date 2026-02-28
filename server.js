@@ -5,8 +5,8 @@ const { Client, LocalAuth } = require('whatsapp-web.js')
 const { execSync } = require('child_process')
 
 const app = express()
-const PORT = process.env.PORT || 3000
-const SECRET = process.env.WA_SECRET || 'carmocream2024'
+const PORT = process.env.PORT || 3000;
+const SECRET = process.env.WA_SECRET; // Sin valor por defecto por seguridad
 
 app.use(cors())
 app.use(express.json())
