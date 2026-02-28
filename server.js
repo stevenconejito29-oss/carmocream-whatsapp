@@ -1,20 +1,20 @@
 /**
  * CarmoCream WhatsApp Server
- * 
+ *
  * PROBLEMA RESUELTO: Railway borra /tmp en cada reinicio, lo que causaba
  * que LocalAuth perdiera la sesión y generara QR en bucle infinito.
- * 
+ *
  * SOLUCIÓN: RemoteAuth con Supabase como store persistente.
  * La sesión se guarda en la tabla `whatsapp_session` de Supabase
  * y se restaura automáticamente al reiniciar el contenedor.
- * 
+ *
  * REQUISITO: Crear esta tabla en Supabase:
  *   CREATE TABLE whatsapp_session (
  *     id TEXT PRIMARY KEY,
  *     data TEXT NOT NULL,
  *     updated_at TIMESTAMPTZ DEFAULT NOW()
  *   );
- * 
+ *
  * Variables de entorno necesarias en Railway:
  *   WA_SECRET=tu_secreto
  *   SUPABASE_URL=https://xxxx.supabase.co
@@ -24,6 +24,8 @@
 const express    = require('express')
 const cors       = require('cors')
 const qrcode     = require('qrcode')
+const fs         = require('fs')
+const path       = require('path')
 const { Client, RemoteAuth } = require('whatsapp-web.js')
 const { execSync } = require('child_process')
 
@@ -40,8 +42,41 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
 
+// ── Esperar a que exista un archivo (con timeout) ────────────────
+function waitForFile(filePath, timeoutMs = 15000, intervalMs = 500) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now()
+    const check = () => {
+      if (fs.existsSync(filePath)) return resolve()
+      if (Date.now() - start >= timeoutMs) return reject(new Error(`Timeout esperando: ${filePath}`))
+      setTimeout(check, intervalMs)
+    }
+    check()
+  })
+}
+
+// ── Guardar sesión zip en Supabase ───────────────────────────────
+async function saveSessionToSupabase() {
+  const zipPath = path.join(process.cwd(), 'RemoteAuth-carmocream.zip')
+
+  try {
+    // FIX: esperar a que RemoteAuth termine de escribir el zip
+    await waitForFile(zipPath, 15000)
+
+    const buf    = fs.readFileSync(zipPath)
+    const base64 = buf.toString('base64')
+
+    await supabase.from('whatsapp_session').upsert(
+      { id: 'carmocream', data: base64, updated_at: new Date().toISOString() },
+      { onConflict: 'id' }
+    )
+    console.log('[Session] ✅ Sesión guardada en Supabase correctamente')
+  } catch (e) {
+    console.error('[Session] Error guardando sesión:', e.message)
+  }
+}
+
 // ── SupabaseStore para RemoteAuth ────────────────────────────────
-// RemoteAuth necesita un "store" con métodos: sessionExists, save, extract, delete
 class SupabaseStore {
   constructor() {
     this.supabase = supabase
@@ -62,10 +97,10 @@ class SupabaseStore {
     }
   }
 
+  // FIX: save ahora llama a saveSessionToSupabase en lugar de no hacer nada
   async save({ session }) {
-    // RemoteAuth pasa la ruta del zip de sesión
-    // Aquí solo confirmamos que existe — el archivo ya fue guardado por extract
     console.log('[SupabaseStore] save llamado para sesión:', session)
+    await saveSessionToSupabase()
   }
 
   async extract({ session, path: destPath }) {
@@ -81,10 +116,9 @@ class SupabaseStore {
         return
       }
 
-      const fs = require('fs')
       const buf = Buffer.from(data.data, 'base64')
       fs.writeFileSync(destPath, buf)
-      console.log('[SupabaseStore] Sesión restaurada desde Supabase')
+      console.log('[SupabaseStore] ✅ Sesión restaurada desde Supabase')
     } catch (e) {
       console.error('[SupabaseStore] extract error:', e)
     }
@@ -202,17 +236,14 @@ function initClient() {
     console.log('🔐 Autenticado correctamente')
   })
 
-  // RemoteAuth guarda la sesión cuando se emite este evento
   client.on('remote_session_saved', () => {
     console.log('💾 Sesión guardada en Supabase')
-    // Guardamos el zip de sesión en Supabase manualmente
     saveSessionToSupabase()
   })
 
   client.on('auth_failure', (msg) => {
     console.error('❌ Fallo de autenticación:', msg)
     isReady = false
-    // Borrar sesión corrupta y reintentar
     store.delete({ session: 'carmocream' }).then(() => {
       setTimeout(() => initClient(), 8000)
     })
@@ -221,39 +252,12 @@ function initClient() {
   client.on('disconnected', (reason) => {
     console.log('🔌 Desconectado:', reason)
     isReady = false
-    const delay = Math.min(5000 * initAttempts, 60000) // backoff: máx 60s
+    const delay = Math.min(5000 * initAttempts, 60000)
     console.log(`Reintentando en ${delay / 1000}s...`)
     setTimeout(() => initClient(), delay)
   })
 
   client.initialize()
-}
-
-// ── Guardar sesión zip en Supabase ───────────────────────────────
-async function saveSessionToSupabase() {
-  const fs   = require('fs')
-  const path = require('path')
-
-  // RemoteAuth guarda el zip en el directorio de trabajo
-  const zipPath = path.join(process.cwd(), 'RemoteAuth-carmocream.zip')
-
-  if (!fs.existsSync(zipPath)) {
-    console.warn('[Session] No se encontró el zip de sesión en:', zipPath)
-    return
-  }
-
-  try {
-    const buf    = fs.readFileSync(zipPath)
-    const base64 = buf.toString('base64')
-
-    await supabase.from('whatsapp_session').upsert(
-      { id: 'carmocream', data: base64, updated_at: new Date().toISOString() },
-      { onConflict: 'id' }
-    )
-    console.log('[Session] ✅ Sesión guardada en Supabase correctamente')
-  } catch (e) {
-    console.error('[Session] Error guardando sesión:', e)
-  }
 }
 
 initClient()
