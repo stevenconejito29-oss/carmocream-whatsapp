@@ -19,6 +19,7 @@ function initClient() {
     authStrategy: new LocalAuth({ dataPath: '/tmp/wwebjs_auth' }),
     puppeteer: {
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/run/current-system/sw/bin/chromium',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
