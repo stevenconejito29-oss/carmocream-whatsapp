@@ -2,6 +2,7 @@ const express = require('express')
 const cors = require('cors')
 const qrcode = require('qrcode')
 const { Client, LocalAuth } = require('whatsapp-web.js')
+const { execSync } = require('child_process')
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -14,23 +15,52 @@ let qrImageBase64 = null
 let isReady = false
 let client = null
 
+function findChromium() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    console.log('Usando PUPPETEER_EXECUTABLE_PATH:', process.env.PUPPETEER_EXECUTABLE_PATH)
+    return process.env.PUPPETEER_EXECUTABLE_PATH
+  }
+  const candidates = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ]
+  for (const p of candidates) {
+    try {
+      execSync(`test -f "${p}"`)
+      console.log('Chromium encontrado en:', p)
+      return p
+    } catch {}
+  }
+  console.log('Chromium no encontrado manualmente, dejando que puppeteer lo busque')
+  return undefined
+}
+
+const CHROMIUM_PATH = findChromium()
+
 function initClient() {
+  const puppeteerConfig = {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu'
+    ]
+  }
+
+  if (CHROMIUM_PATH) {
+    puppeteerConfig.executablePath = CHROMIUM_PATH
+  }
+
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: '/tmp/wwebjs_auth' }),
-    puppeteer: {
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/run/current-system/sw/bin/chromium',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
-      ]
-    }
+    puppeteer: puppeteerConfig
   })
 
   client.on('qr', async (qr) => {
