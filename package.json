@@ -10,7 +10,6 @@
     "whatsapp-web.js": "^1.23.0",
     "qrcode": "^1.5.3",
     "cors": "^2.8.5",
-    "puppeteer": "^21.0.0",
-    "puppeteer-core": "^21.0.0"
+    "puppeteer": "^24.15.0"
   }
 }
