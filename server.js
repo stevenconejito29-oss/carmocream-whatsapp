@@ -1,49 +1,112 @@
 // server.js — CarmoCream WhatsApp (Railway)
-// Sesión persistida en Supabase como JSON (sin zip, sin timeout)
+// ✅ Versión segura: CORS restringido, rate limiting, validaciones, sin secretos hardcodeados
 
-const express   = require('express')
+const express    = require('express')
 const { Client, LocalAuth } = require('whatsapp-web.js')
-const { createClient } = require('@supabase/supabase-js')
-const cors      = require('cors')
-const fs        = require('fs')
-const path      = require('path')
+const { createClient }      = require('@supabase/supabase-js')
+const cors       = require('cors')
+const rateLimit  = require('express-rate-limit')
+const fs         = require('fs')
+const path       = require('path')
 
-const app    = express()
-const PORT   = process.env.PORT || 3000
-const SECRET = process.env.WA_SECRET || 'carmocream2024'
+const app  = express()
+const PORT = process.env.PORT || 3000
 
-// ── CORS — permite peticiones desde cualquier origen (frontend en Vercel/localhost) ──
+// ── 🔐 Secreto obligatorio — falla si no está en variables de entorno ─────────
+const SECRET = process.env.WA_SECRET
+if (!SECRET) {
+  console.error('❌ FATAL: WA_SECRET no está configurado en las variables de entorno de Railway.')
+  console.error('   Ve a Railway → tu servicio → Variables → añade WA_SECRET=un-secreto-seguro')
+  process.exit(1)
+}
+
+// ── 🔐 CORS — solo acepta peticiones desde tu dominio ─────────────────────────
+// Añade aquí todos los dominios desde los que llamas al servidor
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean)
+
+// Si no hay ALLOWED_ORIGINS configurado, solo permite localhost en desarrollo
+if (ALLOWED_ORIGINS.length === 0) {
+  console.warn('⚠️  ALLOWED_ORIGINS no configurado. Solo se permite localhost.')
+  ALLOWED_ORIGINS.push('http://localhost:5173', 'http://localhost:3000')
+}
+
 app.use(cors({
-  origin: '*',
+  origin: (origin, callback) => {
+    // Permitir peticiones sin origin (Postman, curl, Railway health checks)
+    if (!origin) return callback(null, true)
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
+    console.warn(`[CORS] Bloqueado origin: ${origin}`)
+    callback(new Error(`Origin no permitido: ${origin}`))
+  },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'x-secret'],
 }))
-app.options('*', cors()) // preflight
+app.options('*', cors())
 
-// ── Supabase (usa service_role para bypass RLS) ───────────────────────────────
+// ── Supabase (service_role para bypass RLS) ───────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-app.use(express.json())
+// ── Body parser con límite de tamaño ─────────────────────────────────────────
+app.use(express.json({ limit: '50kb' }))
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// ── 🔐 Auth middleware ────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const secret = req.headers['x-secret'] || req.query.secret
-  if (secret !== SECRET) return res.status(401).json({ error: 'Unauthorized' })
+  if (!secret || secret !== SECRET) {
+    console.warn(`[Auth] Intento no autorizado desde ${req.ip}`)
+    return res.status(401).json({ error: 'No autorizado' })
+  }
   next()
+}
+
+// ── 🔐 Rate limiting — máx 30 peticiones/minuto por IP en /send ───────────────
+const sendLimiter = rateLimit({
+  windowMs:        60 * 1000,   // 1 minuto
+  max:             30,           // máx 30 mensajes por minuto por IP
+  standardHeaders: true,
+  legacyHeaders:   false,
+  handler: (req, res) => {
+    console.warn(`[RateLimit] IP bloqueada: ${req.ip}`)
+    res.status(429).json({ success: false, error: 'Demasiadas peticiones. Espera un minuto.' })
+  },
+})
+
+// Rate limit general — máx 100 peticiones/minuto por IP
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max:      100,
+  standardHeaders: true,
+  legacyHeaders:   false,
+})
+app.use(globalLimiter)
+
+// ── 🔐 Validar número de teléfono ────────────────────────────────────────────
+function validatePhone(raw) {
+  const digits = String(raw || '').replace(/\D/g, '')
+  if (digits.length < 9 || digits.length > 15) return null
+  // Normalizar a formato internacional
+  if (digits.startsWith('34') && digits.length === 11) return digits
+  if (digits.length === 9) return `34${digits}`
+  if (digits.length >= 10) return digits
+  return null
+}
+
+// ── 🔐 Sanitizar mensaje ──────────────────────────────────────────────────────
+function sanitizeMessage(raw) {
+  if (!raw || typeof raw !== 'string') return null
+  const trimmed = raw.trim()
+  if (trimmed.length === 0 || trimmed.length > 2000) return null
+  return trimmed
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // SESIÓN EN SUPABASE
-// Tabla (crear una vez en Supabase SQL Editor):
-//
-//   create table if not exists whatsapp_sessions (
-//     id         text primary key,
-//     data       jsonb,
-//     updated_at timestamptz default now()
-//   );
 // ══════════════════════════════════════════════════════════════════════════════
 
 const SESSION_ID   = 'carmocream'
@@ -127,7 +190,6 @@ async function initClient() {
   client.on('authenticated', async () => {
     console.log('🔐 Autenticado correctamente')
     lastQr = null
-    // Guardar sesión tras autenticación (pequeño delay para que wwebjs escriba el archivo)
     setTimeout(saveSession, 3000)
   })
 
@@ -135,7 +197,6 @@ async function initClient() {
     console.log('✅ WhatsApp conectado y listo')
     isReady = true
     lastQr  = null
-    // Guardar sesión al estar listo
     setTimeout(saveSession, 2000)
   })
 
@@ -146,7 +207,6 @@ async function initClient() {
       await supabase.from('whatsapp_sessions').delete().eq('id', SESSION_KEY)
       console.log('[Session] Eliminada de Supabase (logout)')
     }
-    // Reconectar tras 8 segundos
     setTimeout(() => {
       console.log('♻️  Reconectando...')
       client?.destroy().catch(() => {})
@@ -154,9 +214,7 @@ async function initClient() {
     }, 8000)
   })
 
-  // Guardar sesión cada 15 min como respaldo
   setInterval(saveSession, 15 * 60 * 1000)
-
   await client.initialize()
 }
 
@@ -164,12 +222,12 @@ async function initClient() {
 // ENDPOINTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Health check público
-app.get('/', (req, res) => {
+// ── Health check — solo indica si el servicio responde, sin datos sensibles ──
+app.get('/', auth, (req, res) => {
   res.json({ ok: true, ready: isReady, service: 'CarmoCream WhatsApp' })
 })
 
-// Ver QR en el navegador (protegido)
+// ── Ver QR en el navegador (protegido) ───────────────────────────────────────
 app.get('/status', auth, (req, res) => {
   if (isReady) {
     return res.send(`
@@ -201,25 +259,25 @@ app.get('/status', auth, (req, res) => {
   `)
 })
 
-// Enviar mensaje (llamado desde el frontend)
-app.post('/send', auth, async (req, res) => {
-  const { phone, message } = req.body
-  if (!phone || !message) {
-    return res.status(400).json({ success: false, error: 'Faltan phone o message' })
+// ── Enviar mensaje ────────────────────────────────────────────────────────────
+app.post('/send', auth, sendLimiter, async (req, res) => {
+  const phone   = validatePhone(req.body.phone)
+  const message = sanitizeMessage(req.body.message)
+
+  if (!phone) {
+    return res.status(400).json({ success: false, error: 'Teléfono inválido o fuera de rango (9-15 dígitos)' })
+  }
+  if (!message) {
+    return res.status(400).json({ success: false, error: 'Mensaje vacío o demasiado largo (máx 2000 caracteres)' })
   }
   if (!isReady || !client) {
     return res.status(503).json({ success: false, error: 'WhatsApp no está listo' })
   }
 
-  // Normalizar teléfono
-  const digits = String(phone).replace(/\D/g, '')
-  const normalized = (digits.startsWith('34') && digits.length === 11)
-    ? digits
-    : digits.length === 9 ? `34${digits}` : digits
-  const chatId = `${normalized}@c.us`
+  const chatId = `${phone}@c.us`
 
   try {
-    console.log(`[Send] → ${chatId}`)
+    console.log(`[Send] → ${chatId} (${message.length} chars)`)
     await client.sendMessage(chatId, message)
     console.log(`[Send] ✅ Enviado a ${chatId}`)
     res.json({ success: true })
@@ -229,7 +287,7 @@ app.post('/send', auth, async (req, res) => {
   }
 })
 
-// Logout forzado (genera nuevo QR en el siguiente restart)
+// ── Logout forzado ────────────────────────────────────────────────────────────
 app.post('/logout', auth, async (req, res) => {
   try {
     await client?.logout()
@@ -243,5 +301,6 @@ app.post('/logout', auth, async (req, res) => {
 // ── Arrancar ──────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 Servidor en puerto ${PORT}`)
+  console.log(`🔐 CORS permitido para: ${ALLOWED_ORIGINS.join(', ')}`)
   initClient().catch(err => console.error('Error fatal:', err))
 })
