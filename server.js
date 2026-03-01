@@ -52,14 +52,25 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-// ── Body parser con límite de tamaño ─────────────────────────────────────────
 app.use(express.json({ limit: '50kb' }))
 
+// ── Railway está detrás de un proxy — necesario para rate-limit e IPs reales ─
+app.set('trust proxy', 1)
+
 // ── 🔐 Auth middleware ────────────────────────────────────────────────────────
+// IPs internas de Railway (100.64.0.0/10) — health checks del proxy, ignorar
+function isRailwayInternal(ip) {
+  return ip && (ip.startsWith('100.64.') || ip === '::ffff:100.64.0.2' || ip === '::ffff:100.64.0.3')
+}
+
 function auth(req, res, next) {
+  // Silenciar health checks internos de Railway
+  if (isRailwayInternal(req.ip)) {
+    return res.status(401).json({ error: 'No autorizado' })
+  }
   const secret = req.headers['x-secret'] || req.query.secret
   if (!secret || secret !== SECRET) {
-    console.warn(`[Auth] Intento no autorizado desde ${req.ip}`)
+    console.warn(`[Auth] Intento no autorizado desde ${req.ip} — ruta: ${req.path}`)
     return res.status(401).json({ error: 'No autorizado' })
   }
   next()
@@ -67,10 +78,11 @@ function auth(req, res, next) {
 
 // ── 🔐 Rate limiting — máx 30 peticiones/minuto por IP en /send ───────────────
 const sendLimiter = rateLimit({
-  windowMs:        60 * 1000,   // 1 minuto
-  max:             30,           // máx 30 mensajes por minuto por IP
+  windowMs:        60 * 1000,
+  max:             30,
   standardHeaders: true,
   legacyHeaders:   false,
+  skip:            (req) => isRailwayInternal(req.ip),
   handler: (req, res) => {
     console.warn(`[RateLimit] IP bloqueada: ${req.ip}`)
     res.status(429).json({ success: false, error: 'Demasiadas peticiones. Espera un minuto.' })
@@ -79,10 +91,11 @@ const sendLimiter = rateLimit({
 
 // Rate limit general — máx 100 peticiones/minuto por IP
 const globalLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max:      100,
+  windowMs:        60 * 1000,
+  max:             100,
   standardHeaders: true,
   legacyHeaders:   false,
+  skip:            (req) => isRailwayInternal(req.ip),
 })
 app.use(globalLimiter)
 
