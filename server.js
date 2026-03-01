@@ -4,12 +4,21 @@
 const express   = require('express')
 const { Client, LocalAuth } = require('whatsapp-web.js')
 const { createClient } = require('@supabase/supabase-js')
+const cors      = require('cors')
 const fs        = require('fs')
 const path      = require('path')
 
 const app    = express()
 const PORT   = process.env.PORT || 3000
 const SECRET = process.env.WA_SECRET || 'carmocream2024'
+
+// ── CORS — permite peticiones desde cualquier origen (frontend en Vercel/localhost) ──
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-secret'],
+}))
+app.options('*', cors()) // preflight
 
 // ── Supabase (usa service_role para bypass RLS) ───────────────────────────────
 const supabase = createClient(
