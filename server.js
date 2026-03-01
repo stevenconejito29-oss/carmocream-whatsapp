@@ -222,9 +222,16 @@ async function initClient() {
 // ENDPOINTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Health check — solo indica si el servicio responde, sin datos sensibles ──
-app.get('/', auth, (req, res) => {
-  res.json({ ok: true, ready: isReady, service: 'CarmoCream WhatsApp' })
+// ── Health check público — solo confirma que el servicio responde ─────────────
+// No expone el estado interno (isReady) sin autenticación
+app.get('/', (req, res) => {
+  const secret = req.headers['x-secret'] || req.query.secret
+  if (secret && secret === SECRET) {
+    // Con auth → devuelve estado completo
+    return res.json({ ok: true, ready: isReady, service: 'CarmoCream WhatsApp' })
+  }
+  // Sin auth → solo confirma que el servidor está vivo
+  res.json({ ok: true, service: 'CarmoCream WhatsApp' })
 })
 
 // ── Ver QR en el navegador (protegido) ───────────────────────────────────────
@@ -283,7 +290,11 @@ app.post('/send', auth, sendLimiter, async (req, res) => {
     res.json({ success: true })
   } catch (err) {
     console.error(`[Send] ❌`, err.message)
-    res.status(500).json({ success: false, error: err.message })
+    // "No LID for user" = el número no tiene WhatsApp activo o es cuenta nueva
+    const userMsg = err.message?.includes('No LID')
+      ? 'El número no tiene WhatsApp activo'
+      : err.message
+    res.status(500).json({ success: false, error: userMsg })
   }
 })
 
