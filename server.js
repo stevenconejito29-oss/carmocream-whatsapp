@@ -2,10 +2,9 @@
 let lastQr = null;
 
 client.on('qr', (qr) => {
-    lastQr = qr; // Guardamos el string del QR
-    console.log(' [!] Nuevo QR generado. Escanéalo en /status');
+    lastQr = qr; // Esto es vital para que el endpoint /status lo encuentre
+    console.log(' [!] Nuevo QR generado. Mantenlo privado.');
 });
-
 // Endpoint para visualizar el QR desde el navegador
 app.get('/status', (req, res) => {
     if (lastQr) {
