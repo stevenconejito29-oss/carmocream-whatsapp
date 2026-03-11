@@ -27,10 +27,17 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .map(o => o.trim())
   .filter(Boolean)
 
-// Si no hay ALLOWED_ORIGINS configurado, solo permite localhost en desarrollo
+// Si no hay ALLOWED_ORIGINS configurado, permite localhost y producción Vercel
 if (ALLOWED_ORIGINS.length === 0) {
-  console.warn('⚠️  ALLOWED_ORIGINS no configurado. Solo se permite localhost.')
-  ALLOWED_ORIGINS.push('http://localhost:5173', 'http://localhost:3000')
+  console.warn('⚠️  ALLOWED_ORIGINS no configurado. Usando defaults.')
+  ALLOWED_ORIGINS.push(
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175',
+    'http://localhost:5176',
+    'http://localhost:3000',
+    'https://carmocream.vercel.app'
+  )
 }
 
 app.use(cors({
@@ -174,6 +181,10 @@ let lastQr  = null
 async function initClient() {
   await restoreSession()
 
+  // ── Módulo chatbot (se configura ANTES de inicializar el cliente) ──
+  // Se llama aquí para que client.on('message') quede registrado a tiempo
+  const setupChatbot = require('./chatbot_railway_webhook')
+
   client = new Client({
     authStrategy: new LocalAuth({
       clientId: SESSION_ID,
@@ -228,6 +239,10 @@ async function initClient() {
   })
 
   setInterval(saveSession, 15 * 60 * 1000)
+
+  // ── Activar chatbot ahora que client existe ─────────────────────────
+  setupChatbot(app, client, process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+
   await client.initialize()
 }
 
@@ -327,4 +342,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Servidor en puerto ${PORT}`)
   console.log(`🔐 CORS permitido para: ${ALLOWED_ORIGINS.join(', ')}`)
   initClient().catch(err => console.error('Error fatal:', err))
-})require('./chatbot_railway_webhook')(app, client, process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+})

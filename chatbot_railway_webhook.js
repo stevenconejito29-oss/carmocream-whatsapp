@@ -22,6 +22,11 @@ module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
     res.json({ ok: true, chatbot: true, version: '1.0.0' })
   })
 
+  // ── Estado del chatbot (para verificación desde el panel admin) ───
+  app.get('/chatbot/status', (req, res) => {
+    res.json({ ok: true, enabled: chatbotEnabled, rules: chatbotRules.length, version: '1.0.0' })
+  })
+
   // ── Cargar reglas desde Supabase ──────────────────────────────────
   let chatbotEnabled = false
   let chatbotRules   = []

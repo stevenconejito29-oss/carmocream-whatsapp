@@ -1,0 +1,1 @@
+fix: chatbot integrado en initClient + CORS localhost/vercel + chatbot/status endpoint
