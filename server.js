@@ -322,6 +322,9 @@ app.post('/logout', auth, async (req, res) => {
   }
 })
 
+
+require('./chatbot_railway_webhook')(app, client, process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+
 // ── Arrancar ──────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 Servidor en puerto ${PORT}`)
