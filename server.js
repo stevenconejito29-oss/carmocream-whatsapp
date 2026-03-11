@@ -327,4 +327,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Servidor en puerto ${PORT}`)
   console.log(`🔐 CORS permitido para: ${ALLOWED_ORIGINS.join(', ')}`)
   initClient().catch(err => console.error('Error fatal:', err))
-})
+})require('./chatbot_railway_webhook')(app, client, process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
