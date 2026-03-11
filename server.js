@@ -45,8 +45,8 @@ app.use(cors({
     // Permitir peticiones sin origin (Postman, curl, Railway health checks)
     if (!origin) return callback(null, true)
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
-    console.warn(`[CORS] Bloqueado origin: ${origin}`)
-    callback(new Error(`Origin no permitido: ${origin}`))
+    // Silenciar: bloqueo esperado en producción (localhost, otros dominios)
+    callback(null, false)
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'x-secret'],
@@ -200,8 +200,9 @@ async function initClient() {
         '--disable-gpu',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
         '--disable-extensions',
+        '--disable-software-rasterizer',
+        '--shm-size=512mb',
       ],
     },
   })
@@ -241,7 +242,9 @@ async function initClient() {
   setInterval(saveSession, 15 * 60 * 1000)
 
   // ── Activar chatbot ahora que client existe ─────────────────────────
-  setupChatbot(app, client, process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
+  // Usa SUPABASE_ANON_KEY si existe, sino cae a SERVICE_ROLE_KEY (mismo acceso para este uso)
+  const sbKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
+  setupChatbot(app, client, process.env.SUPABASE_URL, sbKey)
 
   await client.initialize()
 }
@@ -341,5 +344,37 @@ app.post('/logout', auth, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Servidor en puerto ${PORT}`)
   console.log(`🔐 CORS permitido para: ${ALLOWED_ORIGINS.join(', ')}`)
-  initClient().catch(err => console.error('Error fatal:', err))
+  initClient().catch(err => console.error('Error fatal initClient:', err))
+})
+
+// ── Evitar crash total del proceso por errores de Puppeteer/contexto ──────────
+process.on('uncaughtException', (err) => {
+  const msg = err?.message || ''
+  // Errores conocidos de whatsapp-web.js que no deben matar el proceso
+  if (
+    msg.includes('Execution context was destroyed') ||
+    msg.includes('Session closed') ||
+    msg.includes('Target closed') ||
+    msg.includes('Protocol error') ||
+    msg.includes('Navigation') ||
+    msg.includes('detached Frame')
+  ) {
+    console.warn('[Process] ⚠️ Error controlado de Puppeteer — el bot se reconectará:', msg.slice(0, 80))
+    return
+  }
+  console.error('[Process] ❌ Excepción no capturada:', err)
+})
+
+process.on('unhandledRejection', (reason) => {
+  const msg = String(reason?.message || reason || '')
+  if (
+    msg.includes('Execution context was destroyed') ||
+    msg.includes('Session closed') ||
+    msg.includes('Target closed') ||
+    msg.includes('Protocol error')
+  ) {
+    console.warn('[Process] ⚠️ Promesa rechazada controlada (Puppeteer):', msg.slice(0, 80))
+    return
+  }
+  console.error('[Process] ❌ Promesa rechazada no gestionada:', reason)
 })

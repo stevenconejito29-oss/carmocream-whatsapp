@@ -1,1 +1,1 @@
-chatbot v2.0 state machine cancel escalate takeover
+fix puppeteer crash handler cors silent supabase key fallback
