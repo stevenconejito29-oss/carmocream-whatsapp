@@ -1,29 +1,44 @@
 /**
- * chatbot_railway_webhook.js — CarmoCream v3.0
+ * chatbot_railway_webhook.js — CarmoCream v4.0
  * =====================================================
- * Máquina de estados completa:
- *   - Cancelación con validación de estado del pedido
- *   - Consulta de estado en tiempo real desde Supabase
- *   - Quejas → escalado inmediato al admin
- *   - Solicitud humana → takeover admin
- *   - Anti-spam y cooldown por cliente
- *   - Reglas estáticas personalizables desde el panel
- *   - Automatizaciones de marketing (recordatorios, fidelización)
+ * Máquina de estados inteligente:
+ *   ✅ Cancelación con validación de estado real
+ *   ✅ Estado del pedido en tiempo real con detalle de items
+ *   ✅ Menú y precios dinámicos desde Supabase
+ *   ✅ Cliente reconocido (saludo personalizado)
+ *   ✅ Zona de reparto, horario, alérgenos, formas de pago
+ *   ✅ Cupones activos
+ *   ✅ Modificación de pedido con notificación admin
+ *   ✅ Quejas → escalado inmediato
+ *   ✅ Solicitud humana → takeover admin
+ *   ✅ Agradecimiento → solicita reseña
+ *   ✅ Anti-spam y cooldown
+ *   ✅ Reglas estáticas personalizables desde panel
+ *   ✅ Endpoint post-entrega automático (reseña)
+ *   ✅ Endpoint broadcast marketing
  * =====================================================
  */
 
-const WEB_URL    = process.env.SHOP_URL    || 'https://carmocream.vercel.app'
-const ADMIN_PHONE = process.env.ADMIN_PHONE || '' // ej: 34612345678 (sin +)
+const WEB_URL     = process.env.SHOP_URL    || 'https://carmocream.vercel.app'
+const ADMIN_PHONE = process.env.ADMIN_PHONE || ''
+const VERSION     = '4.0.0'
 
-// ── Estados en los que YA NO se puede cancelar ───────────────────────────────
 const NO_CANCEL_STATES = ['preparing', 'ready', 'delivering', 'delivered']
 const STATE_LABELS = {
   pending:    '⏳ Recibido, pendiente de confirmar',
   preparing:  '👨‍🍳 En preparación',
-  ready:      '✅ Listo para recoger/entregar',
+  ready:      '✅ Listo para entregar',
   delivering: '🛵 En camino hacia ti',
   delivered:  '🎉 Entregado',
   cancelled:  '❌ Cancelado',
+}
+const STATE_TIPS = {
+  pending:    'Lo hemos recibido y lo gestionamos en breve. Te avisamos cuando avance 👍',
+  preparing:  '¡Estamos preparándolo ahora mismo con mucho cariño! En unos minutos sale 🛵',
+  ready:      'Ya está listo y esperando al repartidor. ¡Enseguida está en camino! 🛵',
+  delivering: '¡Tu repartidor ya está en camino! En breve llega a tu puerta 🍓',
+  delivered:  '¡Esperamos que lo hayas disfrutado! Si quieres repetir, ya sabes 😄',
+  cancelled:  'El pedido fue cancelado. Para hacer uno nuevo visita la web 👇',
 }
 
 module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
@@ -31,13 +46,14 @@ module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
   // ══════════════════════════════════════════════════════════════════
   //  ESTADO INTERNO
   // ══════════════════════════════════════════════════════════════════
-  let chatbotEnabled = false
-  let chatbotRules   = []
+  let chatbotEnabled  = false
+  let chatbotRules    = []
+  let productsCache   = []      // cache de productos activos
+  let productsCacheTs = 0       // timestamp del último fetch
+  const PRODUCTS_TTL  = 5 * 60 * 1000  // 5 min
 
-  // Conversaciones activas: phone → { state, pendingCancel, orderNum, ts }
-  const conversations = new Map()
-  // Anti-spam: teléfonos con cooldown activo
-  const recentReplies = new Map() // phone → timestamp
+  const conversations = new Map()  // phone → { state, ...data, ts }
+  const recentReplies = new Map()  // anti-spam: phone → timestamp
 
   // ══════════════════════════════════════════════════════════════════
   //  SUPABASE HELPERS
@@ -66,25 +82,60 @@ module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
       const map  = Object.fromEntries((data || []).map(r => [r.key, r.value]))
       chatbotEnabled = map.chatbot_enabled === 'true'
       try { const p = JSON.parse(map.chatbot_rules || '[]'); if (p.length) chatbotRules = p } catch {}
-      console.log(`[Chatbot] Reglas: ${chatbotRules.length} (activo: ${chatbotEnabled})`)
+      console.log(`[Chatbot] v${VERSION} — Reglas: ${chatbotRules.length} (activo: ${chatbotEnabled})`)
     } catch (e) { console.error('[Chatbot] loadRules:', e.message) }
   }
 
-  // Buscar último pedido activo por teléfono
+  // ── Productos activos con cache de 5 min ─────────────────────────
+  async function getActiveProducts() {
+    if (Date.now() - productsCacheTs < PRODUCTS_TTL && productsCache.length) return productsCache
+    try {
+      const data = await sbFetch('products?active=eq.true&select=id,name,price,description&order=sort_order')
+      productsCache   = data || []
+      productsCacheTs = Date.now()
+    } catch (e) { console.error('[Chatbot] getActiveProducts:', e.message) }
+    return productsCache
+  }
+
+  // ── Cupones activos ───────────────────────────────────────────────
+  async function getActiveCoupons() {
+    try {
+      const now = new Date().toISOString()
+      const data = await sbFetch(
+        `coupons?active=eq.true&select=code,discount_type,discount_value,min_order` +
+        `&or=(expires_at.is.null,expires_at.gt.${now})`
+      )
+      return data || []
+    } catch { return [] }
+  }
+
+  // ── Último pedido activo por teléfono ─────────────────────────────
   async function findLastOrder(phone) {
     try {
       const digits = phone.replace('@c.us', '').replace(/\D/g, '')
-      // Buscar los últimos 5 números posibles (con/sin prefijo)
       const variants = [digits, digits.replace(/^34/, ''), '34' + digits.replace(/^34/, '')]
       const query = variants.map(v => `customer_phone.ilike.*${v.slice(-9)}*`).join(',')
       const data = await sbFetch(
-        `orders?or=(${query})&status=neq.cancelled&order=created_at.desc&limit=1&select=id,order_number,status,total,created_at,items`
+        `orders?or=(${query})&status=neq.cancelled&order=created_at.desc&limit=1` +
+        `&select=id,order_number,status,total,created_at,items,customer_name,delivery_address`
       )
       return (data || [])[0] || null
     } catch (e) { console.error('[Chatbot] findLastOrder:', e.message); return null }
   }
 
-  // Cancelar un pedido
+  // ── Historial del cliente (para personalizar) ─────────────────────
+  async function getCustomerHistory(phone) {
+    try {
+      const digits = phone.replace('@c.us', '').replace(/\D/g, '')
+      const variants = [digits, digits.replace(/^34/, ''), '34' + digits.replace(/^34/, '')]
+      const query = variants.map(v => `customer_phone.ilike.*${v.slice(-9)}*`).join(',')
+      const data = await sbFetch(
+        `orders?or=(${query})&select=id,customer_name,total,status&order=created_at.desc&limit=10`
+      )
+      return data || []
+    } catch { return [] }
+  }
+
   async function cancelOrder(orderId) {
     try {
       await sbFetch(`orders?id=eq.${orderId}`, {
@@ -95,301 +146,349 @@ module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
     } catch (e) { console.error('[Chatbot] cancelOrder:', e.message); return false }
   }
 
-  // Guardar escalación en Supabase
-  async function saveEscalation(phone, reason, lastMessage) {
+  async function saveConversation(phone, state, reason, lastMessage, extra = {}) {
     try {
       await sbFetch('chatbot_conversations', {
         method: 'POST',
         headers: { Prefer: 'resolution=merge-duplicates' },
         body: JSON.stringify({
-          phone,
-          state: 'escalated',
-          escalation_reason: reason,
-          last_message: lastMessage,
-          admin_takeover: false,
-          resolved: false,
-          updated_at: new Date().toISOString(),
+          phone, state, escalation_reason: reason, last_message: lastMessage,
+          admin_takeover: false, resolved: false,
+          updated_at: new Date().toISOString(), ...extra,
         }),
       })
-    } catch (e) { console.error('[Chatbot] saveEscalation:', e.message) }
+    } catch (e) { console.error('[Chatbot] saveConversation:', e.message) }
   }
 
-  // Notificar al admin por WhatsApp
   async function notifyAdmin(text) {
     if (!ADMIN_PHONE || !client) return
+    try { await client.sendMessage(`${ADMIN_PHONE}@c.us`, text) }
+    catch (e) { console.error('[Chatbot] notifyAdmin:', e.message) }
+  }
+
+  // ── Formatear items del pedido ────────────────────────────────────
+  function formatOrderItems(order) {
     try {
-      await client.sendMessage(`${ADMIN_PHONE}@c.us`, text)
-    } catch (e) { console.error('[Chatbot] notifyAdmin:', e.message) }
+      const items = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || [])
+      if (!items.length) return ''
+      return '\n🛒 *Productos:*\n' + items.map(it => {
+        const name = it.product_name || it.name || 'Producto'
+        const qty  = it.qty || it.quantity || 1
+        const price = it.price ? ` · €${Number(it.price * qty).toFixed(2)}` : ''
+        return `  • ${qty}x ${name}${price}`
+      }).join('\n')
+    } catch { return '' }
+  }
+
+  // ── Normalizar texto para matching ───────────────────────────────
+  function norm(text) {
+    return (text || '').toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[¿¡]/g, '')
   }
 
   // ══════════════════════════════════════════════════════════════════
-  //  MÁQUINA DE ESTADOS — lógica central del chatbot
+  //  MÁQUINA DE ESTADOS PRINCIPAL
   // ══════════════════════════════════════════════════════════════════
   async function handleMessage(phone, rawText) {
     if (!chatbotEnabled) return null
 
     const text = (rawText || '').trim()
-    const norm = text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    const n    = norm(text)
     const conv = conversations.get(phone) || { state: 'idle' }
+    const now  = Date.now()
 
-    // ── Admin takeover: bot silenciado para este número ───────────────
+    // ── Admin takeover activo → silenciar bot ─────────────────────
     if (conv.state === 'admin_takeover') return null
 
-    // ── Fuera de horario: respuesta automática ────────────────────────
-    const hour = new Date().getHours()
-    const dayOfWeek = new Date().getDay() // 0=Dom, 1=Lun
-    const isOpen = dayOfWeek !== 1 && hour >= 14 && hour < 21 // Mar-Dom 14-21
-    // Solo para preguntas que implican querer pedir ahora mismo
-    if (!isOpen && /pedir|pedido nuevo|hacer pedido|quiero pedir|quiero uno|ponme|quisiera/.test(norm)) {
-      const nextOpen = dayOfWeek === 1 ? 'mañana martes' : hour < 14 ? 'hoy a las 14:00' : 'mañana'
-      return `🕐 Ahora mismo estamos cerrados.
-
-Nuestro horario: *Martes a Domingo · 14:00 – 21:00*
-
-Abrimos ${nextOpen} — puedes hacer tu pedido ya en la web y lo preparamos en cuanto abramos:
-👉 *${WEB_URL}*
-
-¡Hasta pronto! 🍓`
-    }
-
-    // ── Anti-spam: máx 1 respuesta por msg en los últimos 2s ─────────
-    const now = Date.now()
-    const last = recentReplies.get(phone) || 0
-    if (now - last < 2000) return null
+    // ── Anti-spam: máx 1 respuesta cada 2s ───────────────────────
+    const lastReply = recentReplies.get(phone) || 0
+    if (now - lastReply < 2000) return null
     recentReplies.set(phone, now)
 
-    // ═══════════════════════════════════════════════════════
-    //  ESTADO: esperando_confirmacion_cancelacion
-    //  Cliente dijo "cancelar", le pedimos confirmación
-    // ═══════════════════════════════════════════════════════
-    if (conv.state === 'waiting_cancel_confirm') {
-      conversations.delete(phone)
-      if (/^(si|sí|s|yes|confirmo|cancela|cancelar|dale|ok|claro|por favor)$/i.test(norm)) {
-        const order = conv.order
-        if (!order) return '❌ No encontré tu pedido. Escríbenos *"hablar"* para ayudarte.'
-
-        // Verificar estado actual (puede haber cambiado)
-        let freshOrder = null
-        try {
-          const data = await sbFetch(`orders?id=eq.${order.id}&select=id,order_number,status&limit=1`)
-          freshOrder = (data || [])[0]
-        } catch {}
-
-        const currentStatus = freshOrder?.status || order.status
-        if (NO_CANCEL_STATES.includes(currentStatus)) {
-          return `⚠️ *Lo sentimos, ya no podemos cancelar el pedido #${order.order_number}.*\n\n` +
-            `Estado actual: *${STATE_LABELS[currentStatus] || currentStatus}*\n\n` +
-            `En esta fase el pedido ya está en marcha y no es posible detenerlo.\n\n` +
-            `Si hay algún problema, escríbenos *"queja"* y te atendemos personalmente 🙏`
-        }
-
-        const ok = await cancelOrder(order.id)
-        if (ok) {
-          return `✅ *Pedido #${order.order_number} cancelado correctamente.*\n\n` +
-            `Lamentamos que no hayas podido disfrutarlo esta vez.\n` +
-            `Cuando quieras volver a pedir, aquí estamos 🍓\n\n_CarmoCream · Carmona_`
-        }
-        return `❌ Hubo un problema al cancelar. Escríbenos *"hablar"* y lo resolvemos ahora mismo.`
-      }
-      // Respondió no
-      if (/^(no|nop|nope|nada|cancelar cancelacion|no cancelar)$/i.test(norm)) {
-        return `✅ ¡Perfecto! Tu pedido sigue activo.\n\n¿Puedo ayudarte con algo más? 😊`
-      }
-      // Respuesta no reconocida
-      return `No he entendido. Responde *Sí* para cancelar o *No* para mantener el pedido.`
+    // ── Fuera de horario ──────────────────────────────────────────
+    const hour = new Date().getHours()
+    const day  = new Date().getDay() // 0=Dom, 1=Lun
+    const isOpen = day !== 1 && hour >= 14 && hour < 21
+    if (!isOpen && /pedir|pedido nuevo|hacer pedido|quiero pedir|quiero uno|ponme|quisiera pedir/.test(n)) {
+      const nextStr = day === 1 ? 'mañana martes' : hour < 14 ? 'hoy a las 14:00' : 'mañana'
+      return `🕐 Ahora mismo estamos cerrados.\n\n` +
+        `*Horario: Martes a Domingo · 14:00 – 21:00*\n\n` +
+        `Abrimos ${nextStr} — pero puedes ver el menú y hacer tu pedido ya:\n👉 *${WEB_URL}*\n\n¡Hasta pronto! 🍓`
     }
 
-    // ═══════════════════════════════════════════════════════
-    //  DETECTAR INTENCIÓN: CANCELAR
-    // ═══════════════════════════════════════════════════════
-    if (/cancelar|anular|quiero cancelar|cancela|no lo quiero|me arrepent|no quiero|borra/.test(norm)) {
+    // ──────────────────────────────────────────────────────────────
+    //  ESTADO: esperando confirmación de cancelación
+    // ──────────────────────────────────────────────────────────────
+    if (conv.state === 'waiting_cancel_confirm') {
+      conversations.delete(phone)
+      if (/^(si|sí|s|yes|confirmo|cancela|cancelar|dale|ok|claro|por favor|adelante)$/i.test(n)) {
+        const order = conv.order
+        if (!order) return '❌ No encontré tu pedido. Escribe *"hablar"* y te ayudamos.'
+        // Re-verificar estado actual
+        let freshStatus = order.status
+        try {
+          const d = await sbFetch(`orders?id=eq.${order.id}&select=status&limit=1`)
+          freshStatus = (d || [])[0]?.status || order.status
+        } catch {}
+        if (NO_CANCEL_STATES.includes(freshStatus)) {
+          return `⚠️ *Ya no podemos cancelar el pedido #${order.order_number}.*\n\n` +
+            `Estado actual: *${STATE_LABELS[freshStatus]}*\n` +
+            `${STATE_TIPS[freshStatus]}\n\n` +
+            `Si hay algún problema cuando lo recibas, escribe *"queja"* y te atendemos 🙏`
+        }
+        const ok = await cancelOrder(order.id)
+        return ok
+          ? `✅ *Pedido #${order.order_number} cancelado.*\n\nLamentamos que no hayas podido disfrutarlo.\nCuando quieras volver, aquí estamos 🍓`
+          : `❌ Hubo un problema al cancelar. Escribe *"hablar"* y lo resolvemos ahora mismo.`
+      }
+      if (/^(no|nop|nope|no cancelar|mantener)$/i.test(n)) {
+        return `✅ ¡Perfecto! Tu pedido sigue activo. ¿Puedo ayudarte con algo más? 😊`
+      }
+      return `Responde *Sí* para cancelar o *No* para mantener el pedido.`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: CANCELAR
+    // ──────────────────────────────────────────────────────────────
+    if (/cancelar|anular|quiero cancelar|cancela|no lo quiero|me arrepent|no quiero el pedido|borra el pedido/.test(n)) {
       const order = await findLastOrder(phone)
-
-      if (!order) {
-        return `❌ No encontré ningún pedido activo en tu número.\n\n` +
-          `Si crees que es un error, escríbenos *"hablar"* y lo revisamos 🙏`
-      }
-
-      // Pedido ya cancelado
-      if (order.status === 'cancelled') {
-        return `ℹ️ Tu pedido *#${order.order_number}* ya estaba cancelado anteriormente.`
-      }
-
-      // Pedido entregado
-      if (order.status === 'delivered') {
-        return `ℹ️ Tu pedido *#${order.order_number}* ya fue entregado, no es posible cancelarlo.\n\n` +
-          `Si tuviste algún problema con él, escríbenos *"queja"* 🙏`
-      }
-
-      // BLOQUEO: ya está en preparación o más avanzado
+      if (!order) return `❌ No encontré ningún pedido activo en tu número.\n\nSi crees que es un error, escribe *"hablar"* 🙏`
+      if (order.status === 'cancelled') return `ℹ️ Tu pedido *#${order.order_number}* ya estaba cancelado.`
+      if (order.status === 'delivered')
+        return `ℹ️ El pedido *#${order.order_number}* ya fue entregado, no se puede cancelar.\nSi tuviste algún problema, escribe *"queja"* 🙏`
       if (NO_CANCEL_STATES.includes(order.status)) {
         return `⚠️ *Lo sentimos, tu pedido #${order.order_number} ya no se puede cancelar.*\n\n` +
-          `Estado actual: *${STATE_LABELS[order.status] || order.status}*\n\n` +
-          `En esta fase ya está siendo preparado o en camino y no podemos pararlo.\n\n` +
-          `Si tienes algún problema cuando lo recibas, escríbenos *"queja"* y te ayudamos 🙏`
+          `Estado actual: *${STATE_LABELS[order.status]}*\n` +
+          `${STATE_TIPS[order.status]}\n\n` +
+          `Si hay algún problema al recibirlo, escribe *"queja"* 🙏`
       }
-
-      // Pedido cancelable (pending) — pedir confirmación
       const total = Number(order.total || 0).toFixed(2)
       conversations.set(phone, { state: 'waiting_cancel_confirm', order, ts: now })
-      return `⚠️ *¿Seguro que quieres cancelar tu pedido?*\n\n` +
+      return `⚠️ *¿Seguro que quieres cancelar?*\n\n` +
         `📋 Pedido *#${order.order_number}* · €${total}\n` +
-        `Estado: ${STATE_LABELS[order.status] || order.status}\n\n` +
+        `Estado: ${STATE_LABELS[order.status]}\n` +
+        `${formatOrderItems(order)}\n\n` +
         `Responde *Sí* para cancelar o *No* para mantenerlo.`
     }
 
-    // ═══════════════════════════════════════════════════════
-    //  DETECTAR INTENCIÓN: ESTADO DEL PEDIDO
-    // ═══════════════════════════════════════════════════════
-    if (/estado|donde esta|mi pedido|cuando llega|lo has recibido|confirmado|cuando sale|tardais|tardáis/.test(norm)) {
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: ESTADO DEL PEDIDO
+    // ──────────────────────────────────────────────────────────────
+    if (/estado|donde esta|mi pedido|cuando llega|lo has recibido|confirmado|cuando sale|tardais|tardáis|ya lo preparan|sigue en pie/.test(n)) {
       const order = await findLastOrder(phone)
-      if (!order) {
-        return `📋 No encontré pedidos activos en tu número.\n\n¿Quieres hacer uno? 👇\n👉 *${WEB_URL}*`
-      }
-      const total   = Number(order.total || 0).toFixed(2)
+      if (!order) return `📋 No encontré pedidos activos en tu número.\n\n¿Quieres hacer uno?\n👉 *${WEB_URL}*`
       const created = new Date(order.created_at).toLocaleTimeString('es-ES', { hour:'2-digit', minute:'2-digit' })
-      return `📋 *Estado de tu pedido #${order.order_number}*\n\n` +
+      const total   = Number(order.total || 0).toFixed(2)
+      return `📋 *Pedido #${order.order_number}*\n\n` +
         `🕐 Pedido a las: ${created}\n` +
         `💰 Total: €${total}\n` +
-        `Estado: *${STATE_LABELS[order.status] || order.status}*\n\n` +
-        (order.status === 'delivering' ? `🛵 ¡Tu repartidor ya está en camino! En breve en tu puerta 🍓` :
-         order.status === 'delivered'  ? `🎉 Pedido entregado. ¡Esperamos que lo hayas disfrutado!` :
-         order.status === 'preparing'  ? `👨‍🍳 Estamos preparándolo con mucho cariño. En unos minutos sale 🛵` :
-         `⏳ Lo hemos recibido y lo gestionamos en breve. Te avisamos por aquí cuando avance.`)
+        `Estado: *${STATE_LABELS[order.status] || order.status}*\n` +
+        `${formatOrderItems(order)}\n\n` +
+        `${STATE_TIPS[order.status] || ''}`
     }
 
-    // ═══════════════════════════════════════════════════════
-    //  DETECTAR INTENCIÓN: QUEJA / PROBLEMA
-    // ═══════════════════════════════════════════════════════
-    if (/queja|reclamacion|reclamación|problema|llego mal|llegó mal|faltaba|estaba mal|no llegó|no llego|frio|frío|derramado|roto|equivocado/.test(norm)) {
-      await saveEscalation(phone, 'Queja/problema con pedido', text)
-      await notifyAdmin(
-        `🚨 *QUEJA — CarmoCream Chatbot*\n\n` +
-        `📞 Cliente: ${phone.replace('@c.us','')}\n` +
-        `💬 Mensaje: "${text.slice(0,200)}"\n\n` +
-        `👉 Panel: ${WEB_URL}/admin → Chatbot → Escalaciones`
-      )
-      return `😔 Sentimos mucho que hayas tenido un problema.\n\n` +
-        `Hemos notificado a nuestro equipo y alguien te contactará *en menos de 30 minutos* para solucionarlo.\n\n` +
-        `Si es urgente también puedes escribirnos aquí mismo y te atendemos al momento 🙏\n\n_CarmoCream · Carmona_`
-    }
-
-    // ═══════════════════════════════════════════════════════
-    //  DETECTAR INTENCIÓN: HABLAR CON HUMANO
-    // ═══════════════════════════════════════════════════════
-    if (/hablar|persona|humano|real|agente|operador|encargado|hablar con vosotros|necesito ayuda|ayuda urgente/.test(norm)) {
-      await saveEscalation(phone, 'Cliente solicita atención humana', text)
-      await notifyAdmin(
-        `🙋 *ATENCIÓN HUMANA — CarmoCream*\n\n` +
-        `📞 Cliente: ${phone.replace('@c.us','')}\n` +
-        `💬 Mensaje: "${text.slice(0,200)}"\n\n` +
-        `👉 Panel: ${WEB_URL}/admin → Chatbot → Escalaciones`
-      )
-      return `¡Claro! 🙋 He notificado a nuestro equipo.\n\n` +
-        `Alguien te responderá *en este mismo chat en unos minutos*.\n\n` +
-        `Mientras tanto, ¿hay algo más que pueda ayudarte? 😊`
-    }
-
-    // ═══════════════════════════════════════════════════════
-    //  DETECTAR INTENCIÓN: SOLICITUD DE FACTURA / COMPROBANTE
-    // ═══════════════════════════════════════════════════════
-    if (/factura|ticket|comprobante|recibo/.test(norm)) {
-      return `🧾 Actualmente solo trabajamos con pago en efectivo y no emitimos facturas fiscales.\n\n` +
-        `Si necesitas un comprobante por escrito, escríbenos *"hablar"* y te lo preparamos manualmente 🙏`
-    }
-
-    // ═══════════════════════════════════════════════════════
-    //  DETECTAR INTENCIÓN: FELICITACIÓN / AGRADECIMIENTO
-    // ═══════════════════════════════════════════════════════
-    if (/gracias|muchas gracias|genial|perfecto|excelente|muy bueno|riquísimo|estaba buenísimo|me encantó|me ha gustado|volvere|volveré/.test(norm)) {
-      // Marcar que este cliente es fidelizable (guardar en Supabase)
-      try {
-        await sbFetch('chatbot_conversations', {
-          method: 'POST',
-          headers: { Prefer: 'resolution=merge-duplicates' },
-          body: JSON.stringify({ phone, state: 'happy', last_message: text, resolved: true, updated_at: new Date().toISOString() }),
-        })
-      } catch {}
-      return `🍓 ¡Muchas gracias! Nos alegra un montón saberlo.\n\n` +
-        `Si tienes un momento, una reseña en Google nos ayuda a llegar a más gente de Carmona:\n` +
-        `👉 https://g.page/r/carmocream/review\n\n` +
-        `*¿Tienes un amigo o familiar al que le gustaría probar CarmoCream?* Compárteles nuestro enlace 💚\n\n` +
-        `👉 *${WEB_URL}*\n\n_¡Hasta pronto! @carmocream_`
-    }
-
-    // ═══════════════════════════════════════════════════════
-    //  DETECTAR INTENCIÓN: MODIFICAR PEDIDO
-    // ═══════════════════════════════════════════════════════
-    if (/cambiar|modificar|cambio|añadir al pedido|quitar del pedido|otro sabor|cambiar dirección|cambiar direccion/.test(norm)) {
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: MODIFICAR PEDIDO
+    // ──────────────────────────────────────────────────────────────
+    if (/cambiar|modificar|cambio|añadir al pedido|quitar del pedido|otro sabor|cambiar direc/.test(n)) {
       const order = await findLastOrder(phone)
-      if (!order) {
-        return `❓ No encontré ningún pedido activo.\n\nPara hacer un nuevo pedido:\n👉 *${WEB_URL}*`
-      }
-      if (NO_CANCEL_STATES.includes(order.status)) {
-        return `⚠️ Tu pedido *#${order.order_number}* ya está *${STATE_LABELS[order.status]}* y no se puede modificar.\n\n` +
-          `Si hay un problema al recibirlo, escríbenos *"queja"* 🙏`
-      }
-      await saveEscalation(phone, 'Solicitud de modificación de pedido', text)
-      await notifyAdmin(
-        `✏️ *MODIFICACIÓN PEDIDO — CarmoCream*\n\n` +
-        `📞 ${phone.replace('@c.us','')} · Pedido #${order.order_number} (€${Number(order.total||0).toFixed(2)})\n` +
-        `💬 "${text.slice(0,150)}"\n\n👉 ${WEB_URL}/admin`
-      )
-      return `✏️ Recibida tu solicitud de cambio para el pedido *#${order.order_number}*.\n\n` +
-        `Hemos avisado al equipo. Te confirmamos en breve si es posible.\n\n` +
-        `Si es urgente escríbenos *"hablar"* 🙏`
+      if (!order) return `❓ No encontré ningún pedido activo.\n\nPara hacer uno:\n👉 *${WEB_URL}*`
+      if (NO_CANCEL_STATES.includes(order.status))
+        return `⚠️ Tu pedido *#${order.order_number}* ya está en *${STATE_LABELS[order.status]}* y no se puede modificar.\n\nSi hay un problema al recibirlo, escribe *"queja"* 🙏`
+      await saveConversation(phone, 'escalated', 'Solicitud de modificación', text)
+      await notifyAdmin(`✏️ *MODIFICACIÓN — CarmoCream*\n\n📞 ${phone.replace('@c.us','')} · #${order.order_number}\n💬 "${text.slice(0,150)}"\n\n👉 ${WEB_URL}/admin`)
+      return `✏️ Recibida tu solicitud para el pedido *#${order.order_number}*.\nHemos avisado al equipo. Te confirmamos en breve si es posible 🙏`
     }
 
-    // ═══════════════════════════════════════════════════════
-    //  REGLAS ESTÁTICAS (cargadas desde el panel admin)
-    // ═══════════════════════════════════════════════════════
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: VER MENÚ / PRECIOS
+    // ──────────────────────────────────────────────────────────────
+    if (/menu|carta|que teneis|que tienen|que vendeis|que haceis|que ofreceis|productos|que hay|que preparais|que tipos|ver lo que|lista de|catalogo|catálogo/.test(n)) {
+      const products = await getActiveProducts()
+      if (!products.length) return `Ahora mismo estamos actualizando el menú. Puedes verlo completo en:\n👉 *${WEB_URL}*`
+      const list = products.map(p => `• *${p.name}* — €${Number(p.price||0).toFixed(2)}`).join('\n')
+      return `🍓 *Menú CarmoCream* — Todo Sin Lactosa\n\n${list}\n\n👉 Pide directamente en: *${WEB_URL}*\n\n¿Te apetece algo? 😋`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: PRECIO ESPECÍFICO
+    // ──────────────────────────────────────────────────────────────
+    if (/cuanto cuesta|cuanto vale|que precio|precio de|cuanto es|cuanto cobr|cuanto tienen|cuanto valen|a cuanto/.test(n)) {
+      const products = await getActiveProducts()
+      if (!products.length) return `Puedes ver todos los precios en:\n👉 *${WEB_URL}*`
+      // Buscar si pregunta por un producto específico
+      const match = products.find(p => n.includes(norm(p.name)))
+      if (match) {
+        return `💰 *${match.name}* cuesta *€${Number(match.price||0).toFixed(2)}*\n\n👉 Pide en: *${WEB_URL}*`
+      }
+      const list = products.map(p => `• *${p.name}* — €${Number(p.price||0).toFixed(2)}`).join('\n')
+      return `💰 *Nuestros precios:*\n\n${list}\n\n👉 Haz tu pedido en: *${WEB_URL}* 🛒`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: DESCUENTOS / CUPONES
+    // ──────────────────────────────────────────────────────────────
+    if (/descuento|cupon|cupón|codigo|oferta|promo|promocion|rebaja|mas barato|teneis algo/.test(n)) {
+      const coupons = await getActiveCoupons()
+      if (!coupons.length)
+        return `Ahora mismo no tenemos promociones activas 😊\nSíguenos en Instagram para enterarte antes que nadie:\n👉 @carmocream_\n\nPuedes ver el menú en: *${WEB_URL}*`
+      const list = coupons.map(c => {
+        const val = c.discount_type === 'percent'
+          ? `${c.discount_value}% descuento`
+          : `€${Number(c.discount_value||0).toFixed(2)} de descuento`
+        const min = c.min_order ? ` (mínimo €${Number(c.min_order).toFixed(2)})` : ''
+        return `🎟️ *${c.code}* — ${val}${min}`
+      }).join('\n')
+      return `🎟️ *Promociones activas:*\n\n${list}\n\nAplícalos al hacer el pedido en:\n👉 *${WEB_URL}* 🛒`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: HORARIO
+    // ──────────────────────────────────────────────────────────────
+    if (/horario|cuando abris|cuando abrís|a que hora|cuando estais|cerrado|abierto|horas|dias de la semana/.test(n)) {
+      const day = new Date().getDay(), hour = new Date().getHours()
+      const isOpenNow = day !== 1 && hour >= 14 && hour < 21
+      return `🕐 *Horario CarmoCream*\n\n📅 Martes a Domingo: 14:00 – 21:00\n❌ Lunes: cerrado\n\n` +
+        `${isOpenNow ? '🟢 *Ahora estamos abiertos* 🍓' : '🔴 Ahora estamos cerrados.'}\n\n👉 *${WEB_URL}*`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: ZONA DE REPARTO
+    // ──────────────────────────────────────────────────────────────
+    if (/zona|repartis|repartís|llegais|llegáis|entregais|domicilio|delivery|reparto|envio|envío|cubris|barrio|llegar a/.test(n)) {
+      return `🛵 *Zona de reparto:*\n\nRepartimos por *Carmona* y alrededores.\n\nSi no estás seguro/a de si llegamos a tu zona, indícanos la dirección y te confirmamos 😊\n\n👉 *${WEB_URL}*`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: FORMAS DE PAGO
+    // ──────────────────────────────────────────────────────────────
+    if (/pago|pagar|como se paga|metodo|bizum|tarjeta|efectivo|transferencia|aceptais|aceptáis/.test(n)) {
+      return `💳 *Formas de pago:*\n\n• 💳 Tarjeta (crédito/débito)\n• 📲 Bizum\n• 💵 Efectivo al repartidor\n\n👉 *${WEB_URL}*`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: ALÉRGENOS / SIN LACTOSA
+    // ──────────────────────────────────────────────────────────────
+    if (/alergeno|alérgeno|lactosa|sin lactosa|intolerante|gluten|vegano|ingredientes|que lleva|que contiene|sin azucar|dieta/.test(n)) {
+      return `🌿 *CarmoCream — 100% Sin Lactosa*\n\nTodos nuestros productos son elaborados *sin lactosa*.\n\nSi tienes alguna alergia específica (gluten, frutos secos…), escribe *"hablar"* y te informamos en detalle 🙏`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: TIEMPO DE ENTREGA
+    // ──────────────────────────────────────────────────────────────
+    if (/cuanto tarda|cuánto tarda|tiempo de entrega|tiempo estimado|rapido|rápido|en cuanto|a partir de cuando/.test(n)) {
+      return `⏱️ El tiempo habitual de entrega es de *30–45 minutos* desde que confirmas el pedido.\n\nTe mantenemos informado aquí mismo en todo momento 🍓\n\n👉 *${WEB_URL}*`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: PEDIDO MÍNIMO / GASTOS DE ENVÍO
+    // ──────────────────────────────────────────────────────────────
+    if (/minimo|mínimo|pedido minimo|gastos de envio|gastos envio|hay minimo/.test(n)) {
+      return `📦 ¡No tenemos pedido mínimo! 🎉\n\nPuedes pedir lo que quieras en:\n👉 *${WEB_URL}*`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: QUEJA / PROBLEMA
+    // ──────────────────────────────────────────────────────────────
+    if (/queja|reclamacion|reclamación|problema|llego mal|llegó mal|faltaba|estaba mal|no llegó|frio|frío|derramado|roto|equivocado|mal estado/.test(n)) {
+      await saveConversation(phone, 'escalated', 'Queja/problema con pedido', text)
+      await notifyAdmin(`🚨 *QUEJA — CarmoCream*\n\n📞 ${phone.replace('@c.us','')}\n💬 "${text.slice(0,200)}"\n\n👉 ${WEB_URL}/admin → Chatbot → Escalaciones`)
+      return `😔 Sentimos mucho el problema.\n\nHemos notificado al equipo y alguien te contactará *en menos de 30 minutos* para solucionarlo.\n\nSi es urgente escribe *"hablar"* 🙏\n\n_CarmoCream · Carmona_`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: HABLAR CON HUMANO
+    // ──────────────────────────────────────────────────────────────
+    if (/hablar|persona|humano|real|agente|operador|encargado|necesito ayuda|ayuda urgente|hola quiero hablar/.test(n)) {
+      await saveConversation(phone, 'escalated', 'Cliente solicita atención humana', text)
+      await notifyAdmin(`🙋 *ATENCIÓN HUMANA — CarmoCream*\n\n📞 ${phone.replace('@c.us','')}\n💬 "${text.slice(0,200)}"\n\n👉 ${WEB_URL}/admin → Chatbot → Escalaciones`)
+      return `¡Claro! 🙋 He notificado al equipo.\n\nAlguien te responderá *en este mismo chat en unos minutos*.\n\n¿Hay algo más en lo que pueda ayudarte mientras? 😊`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: FACTURA / COMPROBANTE
+    // ──────────────────────────────────────────────────────────────
+    if (/factura|ticket|comprobante|recibo/.test(n)) {
+      return `🧾 Actualmente solo emitimos comprobante de pago digital al completar el pedido en la web.\n\nSi necesitas algo específico, escribe *"hablar"* y te ayudamos 🙏`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: AGRADECIMIENTO / SATISFACCIÓN
+    // ──────────────────────────────────────────────────────────────
+    if (/gracias|muchas gracias|genial|perfecto|excelente|muy bueno|riquísimo|estaba buenísimo|me encantó|me gusto|volveré|volvere|repetire/.test(n)) {
+      try {
+        await saveConversation(phone, 'happy', null, text, { resolved: true })
+      } catch {}
+      return `🍓 ¡Muchísimas gracias! Nos alegra un montón saberlo.\n\n` +
+        `Si tienes un momento, una reseña en Google nos ayuda muchísimo a llegar a más gente de Carmona:\n` +
+        `👉 https://g.page/r/carmocream/review\n\n` +
+        `*¿Tienes amigos o familia a los que les podría gustar?* Comparte el enlace 💚\n👉 *${WEB_URL}*\n\n_¡Hasta pronto! @carmocream_`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: SALUDO / PRIMERA VEZ
+    // ──────────────────────────────────────────────────────────────
+    if (/^(hola|buenas|buenas tardes|buenos dias|good morning|hello|ey|ei|hey|saludos|holi)$/i.test(n.trim())) {
+      const history = await getCustomerHistory(phone)
+      const isReturning = history.length > 0
+      const firstName = history[0]?.customer_name?.split(' ')[0] || ''
+      if (isReturning) {
+        return `¡Hola${firstName ? ` ${firstName}` : ''}! 🍓 ¡Qué alegría tenerte de vuelta!\n\n` +
+          `¿Hacemos tu pedido de siempre o quieres ver las novedades?\n👉 *${WEB_URL}*\n\n` +
+          `Escríbeme si necesitas cualquier cosa 😊`
+      }
+      return `¡Hola! 👋 Bienvenido/a a *CarmoCream* — Helados y postres artesanales 100% Sin Lactosa 🍓\n\n` +
+        `Puedo ayudarte con:\n` +
+        `🛒 Ver el menú → escribe *"menú"*\n` +
+        `💰 Precios → escribe *"precios"*\n` +
+        `📋 Estado de tu pedido → escribe *"mi pedido"*\n` +
+        `🕐 Horario → escribe *"horario"*\n\nO haz tu pedido directamente:\n👉 *${WEB_URL}*`
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  REGLAS ESTÁTICAS (personalizables desde el panel admin)
+    // ──────────────────────────────────────────────────────────────
     const staticRule = chatbotRules.find(r => {
       if (!r.active) return false
-      return r.trigger
-        .split(',')
-        .map(t => t.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''))
-        .some(kw => kw && norm.includes(kw))
+      return r.trigger.split(',')
+        .map(t => norm(t.trim()))
+        .some(kw => kw && n.includes(kw))
     })
-    if (staticRule) {
-      return staticRule.response.replace(/\{\{web\}\}/g, WEB_URL)
-    }
+    if (staticRule) return staticRule.response.replace(/\{\{web\}\}/g, WEB_URL)
 
-    // ═══════════════════════════════════════════════════════
-    //  FALLBACK
-    // ═══════════════════════════════════════════════════════
-    return `👋 ¡Hola! Soy el asistente de *CarmoCream*.\n\n` +
-      `Para hacer tu pedido o ver el menú:\n👉 *${WEB_URL}*\n\n` +
+    // ──────────────────────────────────────────────────────────────
+    //  FALLBACK INTELIGENTE
+    // ──────────────────────────────────────────────────────────────
+    return `👋 ¡Hola! Soy el asistente de *CarmoCream* 🍓\n\n` +
+      `Para hacer tu pedido o ver el menú completo:\n👉 *${WEB_URL}*\n\n` +
       `También puedo ayudarte con:\n` +
-      `• Estado de tu pedido → escribe *"mi pedido"*\n` +
-      `• Cancelar → escribe *"cancelar"*\n` +
-      `• Hablar con nosotros → escribe *"hablar"*\n\n` +
-      `_CarmoCream · Carmona · 100% Sin Lactosa_ 🍓`
+      `• *"menú"* — Ver productos y precios\n` +
+      `• *"mi pedido"* — Estado en tiempo real\n` +
+      `• *"cancelar"* — Cancelar pedido\n` +
+      `• *"horario"* — Cuándo estamos abiertos\n` +
+      `• *"zona"* — Zona de reparto\n` +
+      `• *"pago"* — Formas de pago\n` +
+      `• *"hablar"* — Hablar con el equipo\n\n` +
+      `_CarmoCream · Carmona · Sin Lactosa_ 🍓`
   }
 
   // ══════════════════════════════════════════════════════════════════
-  //  ESCUCHA DE MENSAJES ENTRANTES DE WHATSAPP
+  //  ESCUCHA DE MENSAJES WHATSAPP
   // ══════════════════════════════════════════════════════════════════
   if (client && typeof client.on === 'function') {
     client.on('message', async (msg) => {
       try {
         const chat = await msg.getChat()
         if (chat.isGroup || msg.fromMe || msg.type === 'e2e_notification') return
-
-        const phone = msg.from
-        const reply = await handleMessage(phone, msg.body || '')
+        const reply = await handleMessage(msg.from, msg.body || '')
         if (!reply) return
-
-        // Simular "escribiendo…" para naturalidad
         await chat.sendStateTyping()
-        const delay = 1000 + Math.min((reply.length * 15), 3000)
-        await new Promise(r => setTimeout(r, delay))
+        await new Promise(r => setTimeout(r, Math.min(1200 + reply.length * 12, 4000)))
         await chat.clearState()
-
         await msg.reply(reply)
-        console.log(`[Chatbot] ✅ ${phone}: "${(msg.body||'').slice(0,40)}" → ${reply.slice(0,60)}`)
-      } catch (e) {
-        console.error('[Chatbot] Error:', e.message)
-      }
+        console.log(`[Chatbot] ✅ ${msg.from}: "${(msg.body||'').slice(0,40)}" → ${reply.slice(0,60)}`)
+      } catch (e) { console.error('[Chatbot] Error:', e.message) }
     })
     console.log('[Chatbot] Escucha activada ✅')
   }
@@ -397,14 +496,15 @@ Abrimos ${nextOpen} — puedes hacer tu pedido ya en la web y lo preparamos en c
   // ══════════════════════════════════════════════════════════════════
   //  ENDPOINTS HTTP
   // ══════════════════════════════════════════════════════════════════
-  app.get('/webhook-status', (_, res) => res.json({ ok:true, chatbot:true, version:'3.0.0' }))
+  app.get('/webhook-status', (_, res) => res.json({ ok:true, chatbot:true, version: VERSION }))
 
   app.get('/chatbot/status', (_, res) =>
-    res.json({ ok:true, enabled:chatbotEnabled, rules:chatbotRules.length, conversations:conversations.size, version:'3.0.0' })
+    res.json({ ok:true, enabled:chatbotEnabled, rules:chatbotRules.length, conversations:conversations.size, version: VERSION })
   )
 
   app.post('/chatbot/reload', (req, res) => {
     if (req.headers['x-secret'] !== process.env.WA_SECRET) return res.status(401).json({ ok:false })
+    productsCache = []; productsCacheTs = 0 // invalidar cache de productos
     loadRules().then(() => res.json({ ok:true, rules:chatbotRules.length, enabled:chatbotEnabled }))
   })
 
@@ -419,28 +519,60 @@ Abrimos ${nextOpen} — puedes hacer tu pedido ya en la web y lo preparamos en c
     if (req.headers['x-secret'] !== process.env.WA_SECRET) return res.status(401).json({ ok:false })
     const { phone, release } = req.body || {}
     if (release) {
-      // Reactivar bot para ese número
       conversations.delete(phone)
-      console.log(`[Chatbot] Bot reactivado para ${phone}`)
+      console.log(`[Chatbot] Bot reactivado: ${phone}`)
     } else {
-      // Guardar estado de takeover (el bot ignorará mensajes de este número)
       conversations.set(phone, { state: 'admin_takeover', ts: Date.now() })
-      console.log(`[Chatbot] Admin tomó el chat de ${phone}`)
+      console.log(`[Chatbot] Admin takeover: ${phone}`)
     }
     res.json({ ok:true, phone, release })
   })
 
-  // ── Cargar reglas al arrancar y refrescar cada 5 min ─────────────
+  // ── POST-ENTREGA: pedir reseña automáticamente ────────────────────
+  // Llamado desde el panel admin cuando un pedido pasa a "delivered"
+  app.post('/chatbot/review-request', async (req, res) => {
+    if (req.headers['x-secret'] !== process.env.WA_SECRET) return res.status(401).json({ ok:false })
+    const { phone, customer_name, order_number } = req.body || {}
+    if (!phone || !client) return res.status(400).json({ ok:false, error:'No phone or client' })
+    try {
+      const name = (customer_name||'').split(' ')[0] || 'Cliente'
+      const msg = `🍓 ¡Hola ${name}! Esperamos que hayas disfrutado tu pedido *#${order_number}* de CarmoCream.\n\n` +
+        `Si tienes un momento, una reseña en Google nos ayuda muchísimo:\n👉 https://g.page/r/carmocream/review\n\n` +
+        `¡Hasta pronto! 🙏 *@carmocream_*`
+      await client.sendMessage(`${phone.replace(/\D/g,'')}@c.us`, msg)
+      console.log(`[Chatbot] Review request enviada a ${phone}`)
+      res.json({ ok:true })
+    } catch (e) {
+      console.error('[Chatbot] review-request:', e.message)
+      res.status(500).json({ ok:false, error: e.message })
+    }
+  })
+
+  // ── BROADCAST: mensaje manual a lista de teléfonos ────────────────
+  app.post('/chatbot/broadcast', async (req, res) => {
+    if (req.headers['x-secret'] !== process.env.WA_SECRET) return res.status(401).json({ ok:false })
+    const { phones, message } = req.body || {}
+    if (!phones?.length || !message || !client) return res.status(400).json({ ok:false })
+    let sent = 0, errors = 0
+    for (const phone of phones.slice(0, 50)) { // máx 50 por seguridad
+      try {
+        await client.sendMessage(`${phone.replace(/\D/g,'')}@c.us`, message)
+        sent++
+        await new Promise(r => setTimeout(r, 1500)) // evitar spam ban
+      } catch { errors++ }
+    }
+    res.json({ ok:true, sent, errors })
+  })
+
+  // ── Carga inicial y refresco ──────────────────────────────────────
   loadRules()
   setInterval(loadRules, 5 * 60 * 1000)
 
-  // ── Limpiar conversaciones colgadas (> 30 min sin actividad) ─────
+  // Limpiar conversaciones colgadas > 30 min
   setInterval(() => {
     const cutoff = Date.now() - 30 * 60 * 1000
     for (const [phone, conv] of conversations.entries()) {
-      if ((conv.ts || 0) < cutoff && conv.state !== 'admin_takeover') {
-        conversations.delete(phone)
-      }
+      if ((conv.ts || 0) < cutoff && conv.state !== 'admin_takeover') conversations.delete(phone)
     }
   }, 10 * 60 * 1000)
 }
