@@ -249,6 +249,30 @@ module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
     }
 
     // ──────────────────────────────────────────────────────────────
+    //  LECTURA MEJORADA: número de pedido en el mensaje
+    // ──────────────────────────────────────────────────────────────
+    const orderNumMatch = text.match(/#?(\d{3,6})/)
+    if (orderNumMatch && /pedido|numero|número|ref|referencia/.test(n)) {
+      try {
+        const num = orderNumMatch[1]
+        const data = await sbFetch(`orders?order_number=eq.${num}&select=id,order_number,status,total,created_at,items,customer_name&limit=1`)
+        const found = (data || [])[0]
+        if (found) {
+          const total = Number(found.total || 0).toFixed(2)
+          return `📋 *Pedido #${found.order_number}*\n\nEstado: *${STATE_LABELS[found.status] || found.status}*\n💰 Total: €${total}${formatOrderItems(found)}\n\n${STATE_TIPS[found.status] || ''}\n\n¿Necesitas algo más? Escribe *\'hablar\'* si hay algún problema 🙏`
+        }
+      } catch {}
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  INTENCIÓN: NUEVO PEDIDO (captura UTM para analytics)
+    // ──────────────────────────────────────────────────────────────
+    if (/quiero pedir|hacer un pedido|pedir ahora|pedir fresas|ponme un|quiero uno|quiero unas|me pones|me mandas|voy a pedir/.test(n)) {
+      const utmUrl = `${WEB_URL}?utm_source=whatsapp&utm_medium=chatbot&utm_campaign=direct`
+      return `🍓 ¡Perfecto! Haz tu pedido aquí:\n👉 *${utmUrl}*\n\nEn menos de *30–45 min* lo tienes en casa 🛵\n\n_Pago con tarjeta, Bizum o efectivo._`
+    }
+
+    // ──────────────────────────────────────────────────────────────
     //  INTENCIÓN: CANCELAR
     // ──────────────────────────────────────────────────────────────
     if (/cancelar|anular|quiero cancelar|cancela|no lo quiero|me arrepent|no quiero el pedido|borra el pedido/.test(n)) {
@@ -564,7 +588,53 @@ module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
     res.json({ ok:true, sent, errors })
   })
 
-  // ── Carga inicial y refresco ──────────────────────────────────────
+  // CLIENTES INACTIVOS: telefonos sin pedir en X dias
+  app.get('/chatbot/inactive-customers', async (req, res) => {
+    if (req.headers['x-secret'] !== process.env.WA_SECRET) return res.status(401).json({ ok:false })
+    const days = parseInt(req.query.days || '7')
+    const minOrders = parseInt(req.query.min_orders || '2')
+    try {
+      const cutoff = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString()
+      const data = await sbFetch('orders?status=neq.cancelled&select=customer_phone,customer_name,created_at&order=created_at.desc')
+      const rows = data || []
+      const map = {}
+      for (const r of rows) {
+        if (!r.customer_phone) continue
+        if (!map[r.customer_phone]) map[r.customer_phone] = { phone: r.customer_phone, name: r.customer_name, last: r.created_at, count: 0 }
+        map[r.customer_phone].count++
+      }
+      const inactive = Object.values(map)
+        .filter(c => c.count >= minOrders && c.last < cutoff)
+        .map(c => ({ phone: c.phone, name: c.name, last_order: c.last, total_orders: c.count }))
+        .slice(0, 50)
+      res.json({ ok:true, count: inactive.length, customers: inactive })
+    } catch (e) { res.status(500).json({ ok:false, error: e.message }) }
+  })
+
+  // CLIENTES VIP: 3+ pedidos
+  app.get('/chatbot/vip-customers', async (req, res) => {
+    if (req.headers['x-secret'] !== process.env.WA_SECRET) return res.status(401).json({ ok:false })
+    const minOrders = parseInt(req.query.min_orders || '3')
+    try {
+      const data = await sbFetch('orders?status=neq.cancelled&select=customer_phone,customer_name,total&order=created_at.desc')
+      const rows = data || []
+      const map = {}
+      for (const r of rows) {
+        if (!r.customer_phone) continue
+        if (!map[r.customer_phone]) map[r.customer_phone] = { phone: r.customer_phone, name: r.customer_name, count: 0, spent: 0 }
+        map[r.customer_phone].count++
+        map[r.customer_phone].spent += Number(r.total || 0)
+      }
+      const vips = Object.values(map)
+        .filter(c => c.count >= minOrders)
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 50)
+        .map(c => ({ ...c, spent: Number(c.spent.toFixed(2)) }))
+      res.json({ ok:true, count: vips.length, customers: vips })
+    } catch (e) { res.status(500).json({ ok:false, error: e.message }) }
+  })
+
+  // Carga inicial y refresco ──────────────────────────────────────
   loadRules()
   setInterval(loadRules, 5 * 60 * 1000)
 
