@@ -1,5 +1,7 @@
-// server.js — CarmoCream WhatsApp (Railway)
-// ✅ Versión segura: CORS restringido, rate limiting, validaciones, sin secretos hardcodeados
+// server.js — CarmoCream WhatsApp (Railway) v2.0
+// ✅ Fix crítico: service role key tiene prioridad sobre anon key
+// ✅ CORS dinámico desde env ALLOWED_ORIGINS
+// ✅ Rate limiting, validaciones, sin secretos hardcodeados
 
 const express    = require('express')
 const { Client, LocalAuth } = require('whatsapp-web.js')
@@ -12,112 +14,88 @@ const path       = require('path')
 const app  = express()
 const PORT = process.env.PORT || 3000
 
-// ── 🔐 Secreto obligatorio — falla si no está en variables de entorno ─────────
+// ── 🔐 Secreto obligatorio ─────────────────────────────────────────────────
 const SECRET = process.env.WA_SECRET
 if (!SECRET) {
-  console.error('❌ FATAL: WA_SECRET no está configurado en las variables de entorno de Railway.')
-  console.error('   Ve a Railway → tu servicio → Variables → añade WA_SECRET=un-secreto-seguro')
+  console.error('❌ FATAL: WA_SECRET no está configurado en Railway.')
   process.exit(1)
 }
 
-// ── 🔐 CORS — solo acepta peticiones desde tu dominio ─────────────────────────
-// Añade aquí todos los dominios desde los que llamas al servidor
+// ── 🔐 CORS ────────────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(o => o.trim())
-  .filter(Boolean)
+  .split(',').map(o => o.trim()).filter(Boolean)
 
-// Si no hay ALLOWED_ORIGINS configurado, permite localhost y producción Vercel
 if (ALLOWED_ORIGINS.length === 0) {
   console.warn('⚠️  ALLOWED_ORIGINS no configurado. Usando defaults.')
   ALLOWED_ORIGINS.push(
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:5175',
-    'http://localhost:5176',
-    'http://localhost:3000',
-    'https://carmocream.vercel.app'
+    'http://localhost:5173', 'http://localhost:5174',
+    'http://localhost:5175', 'http://localhost:5176',
+    'http://localhost:3000', 'https://carmocream.vercel.app'
   )
 }
 
 app.use(cors({
-  origin: (origin, callback) => {
-    // Permitir peticiones sin origin (Postman, curl, Railway health checks)
-    if (!origin) return callback(null, true)
-    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
-    // Silenciar: bloqueo esperado en producción (localhost, otros dominios)
-    callback(null, false)
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true)
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true)
+    cb(null, false)
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'x-secret'],
 }))
 app.options('*', cors())
 
-// ── Supabase (service_role para bypass RLS) ───────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-)
+// ── Supabase ────────────────────────────────────────────────────────────────
+// FIX CRÍTICO: service_role KEY primero (tiene permisos para bypass RLS)
+// Si se usa la anon key, las queries a orders/products fallan por RLS
+const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY
+if (!sbKey) {
+  console.error('❌ FATAL: SUPABASE_SERVICE_ROLE_KEY no configurada en Railway.')
+  process.exit(1)
+}
+const supabase = createClient(process.env.SUPABASE_URL, sbKey)
 
 app.use(express.json({ limit: '50kb' }))
-
-// ── Railway está detrás de un proxy — necesario para rate-limit e IPs reales ─
 app.set('trust proxy', 1)
 
-// ── 🔐 Auth middleware ────────────────────────────────────────────────────────
-// IPs internas de Railway (100.64.0.0/10) — health checks del proxy, ignorar
+// ── Auth middleware ─────────────────────────────────────────────────────────
 function isRailwayInternal(ip) {
   return ip && (ip.startsWith('100.64.') || ip === '::ffff:100.64.0.2' || ip === '::ffff:100.64.0.3')
 }
 
 function auth(req, res, next) {
-  // Silenciar health checks internos de Railway
-  if (isRailwayInternal(req.ip)) {
-    return res.status(401).json({ error: 'No autorizado' })
-  }
+  if (isRailwayInternal(req.ip)) return res.status(401).json({ error: 'No autorizado' })
   const secret = req.headers['x-secret'] || req.query.secret
   if (!secret || secret !== SECRET) {
-    console.warn(`[Auth] Intento no autorizado desde ${req.ip} — ruta: ${req.path}`)
+    console.warn(`[Auth] Intento no autorizado desde ${req.ip} — ${req.path}`)
     return res.status(401).json({ error: 'No autorizado' })
   }
   next()
 }
 
-// ── 🔐 Rate limiting — máx 30 peticiones/minuto por IP en /send ───────────────
+// ── Rate limiting ───────────────────────────────────────────────────────────
 const sendLimiter = rateLimit({
-  windowMs:        60 * 1000,
-  max:             30,
-  standardHeaders: true,
-  legacyHeaders:   false,
-  skip:            (req) => isRailwayInternal(req.ip),
-  handler: (req, res) => {
-    console.warn(`[RateLimit] IP bloqueada: ${req.ip}`)
-    res.status(429).json({ success: false, error: 'Demasiadas peticiones. Espera un minuto.' })
-  },
+  windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  skip: (req) => isRailwayInternal(req.ip),
+  handler: (req, res) => res.status(429).json({ success: false, error: 'Demasiadas peticiones.' }),
 })
 
-// Rate limit general — máx 100 peticiones/minuto por IP
 const globalLimiter = rateLimit({
-  windowMs:        60 * 1000,
-  max:             100,
-  standardHeaders: true,
-  legacyHeaders:   false,
-  skip:            (req) => isRailwayInternal(req.ip),
+  windowMs: 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false,
+  skip: (req) => isRailwayInternal(req.ip),
 })
 app.use(globalLimiter)
 
-// ── 🔐 Validar número de teléfono ────────────────────────────────────────────
+// ── Validaciones ────────────────────────────────────────────────────────────
 function validatePhone(raw) {
   const digits = String(raw || '').replace(/\D/g, '')
   if (digits.length < 9 || digits.length > 15) return null
-  // Normalizar a formato internacional
   if (digits.startsWith('34') && digits.length === 11) return digits
   if (digits.length === 9) return `34${digits}`
   if (digits.length >= 10) return digits
   return null
 }
 
-// ── 🔐 Sanitizar mensaje ──────────────────────────────────────────────────────
 function sanitizeMessage(raw) {
   if (!raw || typeof raw !== 'string') return null
   const trimmed = raw.trim()
@@ -181,27 +159,18 @@ let lastQr  = null
 async function initClient() {
   await restoreSession()
 
-  // ── Módulo chatbot (se configura ANTES de inicializar el cliente) ──
-  // Se llama aquí para que client.on('message') quede registrado a tiempo
   const setupChatbot = require('./chatbot_railway_webhook')
 
   client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: SESSION_ID,
-      dataPath:  AUTH_PATH,
-    }),
+    authStrategy: new LocalAuth({ clientId: SESSION_ID, dataPath: AUTH_PATH }),
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
       args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-extensions',
-        '--disable-software-rasterizer',
+        '--no-sandbox', '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', '--disable-gpu',
+        '--no-first-run', '--no-zygote',
+        '--disable-extensions', '--disable-software-rasterizer',
         '--shm-size=512mb',
       ],
     },
@@ -241,9 +210,8 @@ async function initClient() {
 
   setInterval(saveSession, 15 * 60 * 1000)
 
-  // ── Activar chatbot ahora que client existe ─────────────────────────
-  // Usa SUPABASE_ANON_KEY si existe, sino cae a SERVICE_ROLE_KEY (mismo acceso para este uso)
-  const sbKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
+  // ── Pasar SERVICE_ROLE KEY al chatbot para que pueda leer/escribir BD ──
+  // El chatbot usa su propio cliente fetch, necesita la key correcta
   setupChatbot(app, client, process.env.SUPABASE_URL, sbKey)
 
   await client.initialize()
@@ -253,19 +221,16 @@ async function initClient() {
 // ENDPOINTS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Health check público — solo confirma que el servicio responde ─────────────
-// No expone el estado interno (isReady) sin autenticación
+// Health check público
 app.get('/', (req, res) => {
   const secret = req.headers['x-secret'] || req.query.secret
   if (secret && secret === SECRET) {
-    // Con auth → devuelve estado completo
     return res.json({ ok: true, ready: isReady, service: 'CarmoCream WhatsApp' })
   }
-  // Sin auth → solo confirma que el servidor está vivo
   res.json({ ok: true, service: 'CarmoCream WhatsApp' })
 })
 
-// ── Ver QR en el navegador (protegido) ───────────────────────────────────────
+// QR / estado de conexión
 app.get('/status', auth, (req, res) => {
   if (isReady) {
     return res.send(`
@@ -283,7 +248,7 @@ app.get('/status', auth, (req, res) => {
         <div style="background:white;padding:20px;display:inline-block;border:2px solid #2D6A4F;border-radius:15px;">
           <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(lastQr)}" />
         </div>
-        <p style="color:#666;margin-top:20px;">Refresca la página si el código no carga.</p>
+        <p style="color:#666;margin-top:20px;">Refresca si el código no carga.</p>
         <script>setTimeout(()=>location.reload(), 30000)</script>
       </div>
     `)
@@ -297,31 +262,23 @@ app.get('/status', auth, (req, res) => {
   `)
 })
 
-// ── Enviar mensaje ────────────────────────────────────────────────────────────
+// Enviar mensaje
 app.post('/send', auth, sendLimiter, async (req, res) => {
   const phone   = validatePhone(req.body.phone)
   const message = sanitizeMessage(req.body.message)
 
-  if (!phone) {
-    return res.status(400).json({ success: false, error: 'Teléfono inválido o fuera de rango (9-15 dígitos)' })
-  }
-  if (!message) {
-    return res.status(400).json({ success: false, error: 'Mensaje vacío o demasiado largo (máx 2000 caracteres)' })
-  }
-  if (!isReady || !client) {
-    return res.status(503).json({ success: false, error: 'WhatsApp no está listo' })
-  }
+  if (!phone)   return res.status(400).json({ success: false, error: 'Teléfono inválido' })
+  if (!message) return res.status(400).json({ success: false, error: 'Mensaje vacío o demasiado largo' })
+  if (!isReady || !client) return res.status(503).json({ success: false, error: 'WhatsApp no está listo' })
 
   const chatId = `${phone}@c.us`
-
   try {
     console.log(`[Send] → ${chatId} (${message.length} chars)`)
     await client.sendMessage(chatId, message)
     console.log(`[Send] ✅ Enviado a ${chatId}`)
     res.json({ success: true })
   } catch (err) {
-    console.error(`[Send] ❌`, err.message)
-    // "No LID for user" = el número no tiene WhatsApp activo o es cuenta nueva
+    console.error('[Send] ❌', err.message)
     const userMsg = err.message?.includes('No LID')
       ? 'El número no tiene WhatsApp activo'
       : err.message
@@ -329,12 +286,12 @@ app.post('/send', auth, sendLimiter, async (req, res) => {
   }
 })
 
-// ── Logout forzado ────────────────────────────────────────────────────────────
+// Logout forzado
 app.post('/logout', auth, async (req, res) => {
   try {
     await client?.logout()
     await supabase.from('whatsapp_sessions').delete().eq('id', SESSION_KEY)
-    res.json({ success: true, message: 'Sesión cerrada. Reinicia el servidor para nuevo QR.' })
+    res.json({ success: true, message: 'Sesión cerrada. Reinicia para nuevo QR.' })
   } catch (e) {
     res.status(500).json({ success: false, error: e.message })
   }
@@ -344,13 +301,13 @@ app.post('/logout', auth, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Servidor en puerto ${PORT}`)
   console.log(`🔐 CORS permitido para: ${ALLOWED_ORIGINS.join(', ')}`)
+  console.log(`🔑 Usando: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SERVICE_ROLE KEY ✅' : 'ANON KEY ⚠️'}`)
   initClient().catch(err => console.error('Error fatal initClient:', err))
 })
 
-// ── Evitar crash total del proceso por errores de Puppeteer/contexto ──────────
+// ── Manejo de errores de Puppeteer ────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   const msg = err?.message || ''
-  // Errores conocidos de whatsapp-web.js que no deben matar el proceso
   if (
     msg.includes('Execution context was destroyed') ||
     msg.includes('Session closed') ||
@@ -359,7 +316,7 @@ process.on('uncaughtException', (err) => {
     msg.includes('Navigation') ||
     msg.includes('detached Frame')
   ) {
-    console.warn('[Process] ⚠️ Error controlado de Puppeteer — el bot se reconectará:', msg.slice(0, 80))
+    console.warn('[Process] ⚠️ Error controlado Puppeteer:', msg.slice(0, 80))
     return
   }
   console.error('[Process] ❌ Excepción no capturada:', err)
