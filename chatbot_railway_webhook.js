@@ -85,7 +85,10 @@ module.exports = function setupChatbot(app, client, supabaseUrl, supabaseKey) {
       const txt = await res.text().catch(() => '')
       throw new Error(`Supabase ${res.status}: ${txt.slice(0, 200)}`)
     }
-    return res.json()
+    // 204 No Content (PATCH return=minimal, DELETE) — sin JSON
+    if (res.status === 204) return null
+    const text = await res.text()
+    return text ? JSON.parse(text) : null
   }
 
   // ── Cargar settings y reglas de la BD ─────────────────────────────────────
